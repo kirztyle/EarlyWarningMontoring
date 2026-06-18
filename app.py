@@ -29,17 +29,20 @@ BULAN_TEXT_MAP = {
 # =========================================================
 # HELPER: Baca PDF (support enkripsi AES)
 # =========================================================
-def read_pdf_text(pdf_bytes):
+def read_pdf_text(pdf_bytes, last_page_only=False):
     """
     Membaca teks dari PDF bytes. 
     Menangani PDF yang terenkripsi (termasuk null encryption / AES).
+    
+    Args:
+        pdf_bytes: Bytes dari file PDF
+        last_page_only: Jika True, hanya membaca halaman terakhir saja
     """
     reader = PdfReader(BytesIO(pdf_bytes))
     
     # Handle PDF terenkripsi
     if reader.is_encrypted:
         try:
-            # Coba decrypt dengan password kosong (null password)
             reader.decrypt("")
         except Exception as e:
             raise ValueError(
@@ -49,10 +52,18 @@ def read_pdf_text(pdf_bytes):
             )
     
     text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
+    if last_page_only and len(reader.pages) > 0:
+        # Hanya baca halaman terakhir
+        page_text = reader.pages[-1].extract_text()
         if page_text:
-            text += page_text + "\n"
+            text = page_text
+    else:
+        # Baca semua halaman
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    
     return text
 
 
@@ -60,7 +71,7 @@ def read_pdf_text(pdf_bytes):
 # 1️⃣  FUNGSI EKSTRAKSI SLIK
 # =========================================================
 def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
-    text = read_pdf_text(pdf_bytes)
+    text = read_pdf_text(pdf_bytes, last_page_only=False)
 
     # --- Nama ---
     nama = "(Tidak ditemukan)"
@@ -197,16 +208,20 @@ def fmt_rp_id(v):
     return f"{v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
 def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
-    text = read_pdf_text(pdf_bytes)
-
+    # Baca semua halaman dulu untuk deteksi bank
+    text_all = read_pdf_text(pdf_bytes, last_page_only=False)
+    
     # Deteksi bank berdasarkan kata kunci
-    is_bca = bool(re.search(r'REKENING GIRO|REKENING TABUNGAN|BCA|Laporan Mutasi Rekening', text, re.IGNORECASE))
-    is_bri = bool(re.search(r'Statement Date|BRISIM|Opening Balance', text, re.IGNORECASE))
+    is_bca = bool(re.search(r'REKENING GIRO|REKENING TABUNGAN|BCA|Laporan Mutasi Rekening', text_all, re.IGNORECASE))
+    is_bri = bool(re.search(r'Statement Date|BRISIM|Opening Balance', text_all, re.IGNORECASE))
 
     if is_bca and not is_bri:
-        return extract_mutasi_bca(text, pdf_name)
+        # Untuk BCA, baca hanya halaman terakhir
+        text_last = read_pdf_text(pdf_bytes, last_page_only=True)
+        # Tapi untuk nama dan periode, tetap perlu halaman pertama
+        return extract_mutasi_bca(text_all, text_last, pdf_name)
     else:
-        return extract_mutasi_bri(text, pdf_name)
+        return extract_mutasi_bri(text_all, pdf_name)
 
 
 def extract_mutasi_bri(text, pdf_name):
@@ -261,15 +276,22 @@ def extract_mutasi_bri(text, pdf_name):
     }
 
 
-def extract_mutasi_bca(text, pdf_name):
-    """Ekstraksi format BCA (Rekening Giro/Tabungan)"""
-    # --- Nama nasabah ---
+def extract_mutasi_bca(text_all, text_last, pdf_name):
+    """
+    Ekstraksi format BCA (Rekening Giro/Tabungan)
+    
+    Args:
+        text_all: Teks dari semua halaman (untuk nama, cabang, periode)
+        text_last: Teks dari halaman terakhir saja (untuk saldo & mutasi)
+        pdf_name: Nama file PDF
+    """
+    # --- Nama nasabah (dari semua halaman) ---
     nama = "(Tidak ditemukan)"
-    nm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n[^\n]+\n([A-Z][A-Z\s\.,\-]+?)\s*\n(?:JL|JALAN|KP|KEL|KEC|KOTA|DESA|RT|RW|BLOK|NO)', text, re.IGNORECASE)
+    nm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n[^\n]+\n([A-Z][A-Z\s\.,\-]+?)\s*\n(?:JL|JALAN|KP|KEL|KEC|KOTA|DESA|RT|RW|BLOK|NO)', text_all, re.IGNORECASE)
     if nm:
         nama = nm.group(1).strip()
     else:
-        lines = text.splitlines()
+        lines = text_all.splitlines()
         for i, line in enumerate(lines):
             if re.match(r'^REKENING (?:GIRO|TABUNGAN)', line.strip(), re.IGNORECASE):
                 if i + 2 < len(lines):
@@ -278,33 +300,35 @@ def extract_mutasi_bca(text, pdf_name):
                         nama = candidate
                         break
 
-    # --- Cabang ---
+    # --- Cabang (dari semua halaman) ---
     cabang = "(Tidak ditemukan)"
-    cm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n([^\n]+)', text, re.IGNORECASE)
+    cm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n([^\n]+)', text_all, re.IGNORECASE)
     if cm:
         cabang = cm.group(1).strip()
 
-    # --- No Rekening ---
+    # --- No Rekening (dari semua halaman) ---
     no_rek = "(Tidak ditemukan)"
-    rm = re.search(r'NO\.?\s*REKENING\s*[:\s]*(\d+)', text, re.IGNORECASE)
+    rm = re.search(r'NO\.?\s*REKENING\s*[:\s]*(\d+)', text_all, re.IGNORECASE)
     if rm:
         no_rek = rm.group(1)
 
-    # --- Periode ---
+    # --- Periode (dari semua halaman) ---
     bulan_str = "(Tidak ditemukan)"
     tahun_str = "(Tidak ditemukan)"
-    pm = re.search(r'PERIODE\s*[:\s]*([A-Za-z]+)\s+(\d{4})', text, re.IGNORECASE)
+    pm = re.search(r'PERIODE\s*[:\s]*([A-Za-z]+)\s+(\d{4})', text_all, re.IGNORECASE)
     if pm:
         bulan_raw = pm.group(1).upper()
         bulan_str = BULAN_TEXT_MAP.get(bulan_raw, pm.group(1).capitalize())
         tahun_str = pm.group(2)
 
-    # --- Saldo & Mutasi ---
+    # --- Saldo & Mutasi (HANYA dari halaman terakhir) ---
     saldo_awal = total_debet = total_kredit = saldo_akhir = 0.0
 
-    saldo_area_match = re.search(r'SALDO AWAL.*?SALDO AKHIR\s*[:\-]*\s*([\d\.,\-]+)', text, re.IGNORECASE | re.DOTALL)
+    # Cari area SALDO AWAL sampai SALDO AKHIR di halaman terakhir
+    saldo_area_match = re.search(r'SALDO AWAL.*?SALDO AKHIR\s*[:\-]*\s*([\d\.,\-]+)', text_last, re.IGNORECASE | re.DOTALL)
     if saldo_area_match:
         saldo_area = saldo_area_match.group(0)
+        # Ekstrak semua angka dengan format US (dengan koma ribuan dan titik desimal)
         numbers = re.findall(r'-?[\d,]+\.\d{2}', saldo_area)
         if len(numbers) >= 4:
             saldo_awal   = parse_rp_us(numbers[0])
@@ -312,16 +336,17 @@ def extract_mutasi_bca(text, pdf_name):
             total_debet  = parse_rp_us(numbers[2])  # Mutasi DB
             saldo_akhir  = parse_rp_us(numbers[3])
         elif len(numbers) == 3:
+            # Kadang saldo awal tidak ikut tertangkap
             total_kredit = parse_rp_us(numbers[0])
             total_debet  = parse_rp_us(numbers[1])
             saldo_akhir  = parse_rp_us(numbers[2])
 
-    # Fallback: cari per-label
+    # Fallback: cari per-label jika cara di atas gagal
     if saldo_awal == 0 and total_debet == 0:
-        sa = re.search(r'SALDO AWAL\s*[:\s]*(-?[\d,]+\.\d{2})', text, re.IGNORECASE)
-        mc = re.search(r'MUTASI CR\s*[:\s]*(-?[\d,]+\.\d{2})', text, re.IGNORECASE)
-        md = re.search(r'MUTASI DB\s*[:\s]*(-?[\d,]+\.\d{2})', text, re.IGNORECASE)
-        sa2 = re.search(r'SALDO AKHIR\s*[:\s]*(-?[\d,]+\.\d{2})', text, re.IGNORECASE)
+        sa = re.search(r'SALDO AWAL\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
+        mc = re.search(r'MUTASI CR\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
+        md = re.search(r'MUTASI DB\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
+        sa2 = re.search(r'SALDO AKHIR\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
         if sa: saldo_awal = parse_rp_us(sa.group(1))
         if mc: total_kredit = parse_rp_us(mc.group(1))
         if md: total_debet = parse_rp_us(md.group(1))
@@ -559,7 +584,7 @@ else:
     st.subheader("🏦 Rekap Mutasi Rekening")
     st.write("Unggah satu atau beberapa file PDF mutasi rekening (mendukung format **BCA** & **BRI**).")
     
-    st.info("💡 **Catatan:** Untuk PDF e-statement BCA yang terenkripsi, pastikan library **PyCryptodome** sudah terinstall di environment Anda (`pip install PyCryptodome`).")
+    st.info("💡 **Catatan:** Untuk PDF e-statement BCA yang terenkripsi, pastikan library **PyCryptodome** sudah terinstall (`pip install PyCryptodome`).")
 
     uploaded_files = st.file_uploader(
         "Tarik & lepaskan file PDF Mutasi Rekening di sini",
