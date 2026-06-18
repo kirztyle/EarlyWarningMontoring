@@ -17,6 +17,15 @@ BULAN_MAP = {
     '09': 'September','10': 'Oktober', '11': 'November', '12': 'Desember'
 }
 
+BULAN_TEXT_MAP = {
+    'JANUARI': 'Januari', 'FEBRUARI': 'Februari', 'MARET': 'Maret', 'APRIL': 'April',
+    'MEI': 'Mei', 'JUNI': 'Juni', 'JULI': 'Juli', 'AGUSTUS': 'Agustus',
+    'SEPTEMBER': 'September', 'OKTOBER': 'Oktober', 'NOVEMBER': 'November', 'DESEMBER': 'Desember',
+    'JAN': 'Januari', 'FEB': 'Februari', 'MAR': 'Maret', 'APR': 'April',
+    'MAY': 'Mei', 'JUN': 'Juni', 'JUL': 'Juli', 'AUG': 'Agustus',
+    'SEP': 'September', 'OCT': 'Oktober', 'NOV': 'November', 'DEC': 'Desember'
+}
+
 # =========================================================
 # 1️⃣  FUNGSI EKSTRAKSI SLIK
 # =========================================================
@@ -149,8 +158,19 @@ def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
 
 
 # =========================================================
-# 2️⃣  FUNGSI EKSTRAKSI MUTASI REKENING
+# 2️⃣  FUNGSI EKSTRAKSI MUTASI REKENING (MULTI-BANK: BRI & BCA)
 # =========================================================
+def parse_rp_us(s):
+    """Parse format US '151,847.00' → float 151847.00"""
+    try:
+        return float(str(s).replace(',', ''))
+    except Exception:
+        return 0.0
+
+def fmt_rp_id(v):
+    """Format float → string Rupiah format Indonesia: 151.847,00"""
+    return f"{v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+
 def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
     reader = PdfReader(BytesIO(pdf_bytes))
     text = ""
@@ -159,6 +179,18 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         if page_text:
             text += page_text + "\n"
 
+    # Deteksi bank berdasarkan kata kunci
+    is_bca = bool(re.search(r'REKENING GIRO|REKENING TABUNGAN|BCA|Laporan Mutasi Rekening', text, re.IGNORECASE))
+    is_bri = bool(re.search(r'Statement Date|BRISIM|Opening Balance', text, re.IGNORECASE))
+
+    if is_bca and not is_bri:
+        return extract_mutasi_bca(text, pdf_name)
+    else:
+        return extract_mutasi_bri(text, pdf_name)
+
+
+def extract_mutasi_bri(text, pdf_name):
+    """Ekstraksi format BRI (BRISIM)"""
     # --- Nama nasabah ---
     nama = "(Tidak ditemukan)"
     nm = re.search(r'Statement Date\n:\n[\d/]+\n([A-Z][A-Z\s]+?)\s*\n', text)
@@ -179,14 +211,6 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         tahun_str = '20' + parts[2]
 
     # --- Saldo & transaksi ---
-    def parse_rp_id(s):
-        """Parse format Indonesia '151.847,00' → float 151847.00"""
-        try:
-            # Hapus titik (ribuan), ganti koma desimal jadi titik
-            return float(str(s).replace('.', '').replace(',', '.'))
-        except Exception:
-            return 0.0
-
     saldo_awal = total_debet = total_kredit = saldo_akhir = 0.0
 
     sm = re.search(
@@ -196,21 +220,10 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         text
     )
     if sm:
-        # PDF BRI biasanya pakai format US (151,847.00), jadi parse dengan format US dulu
-        def parse_rp_us(s):
-            try:
-                return float(str(s).replace(',', ''))
-            except Exception:
-                return 0.0
         saldo_awal   = parse_rp_us(sm.group(1))
         total_debet  = parse_rp_us(sm.group(2))
         total_kredit = parse_rp_us(sm.group(3))
         saldo_akhir  = parse_rp_us(sm.group(4))
-
-    def fmt_rp_id(v):
-        """Format float → string Rupiah format Indonesia: 151.847,00"""
-        # f"{v:,.2f}" → '151,847.00' (US), lalu swap separator
-        return f"{v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
     return {
         "Nama": nama,
@@ -226,6 +239,105 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         "_saldo_akhir_num": saldo_akhir,
         "Nama File PDF": pdf_name,
     }
+
+
+def extract_mutasi_bca(text, pdf_name):
+    """Ekstraksi format BCA (Rekening Giro/Tabungan)"""
+    # --- Nama nasabah ---
+    nama = "(Tidak ditemukan)"
+    # Pola: setelah "REKENING GIRO/TABUNGAN" -> cabang -> nama nasabah (biasanya ALL CAPS)
+    nm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n[^\n]+\n([A-Z][A-Z\s\.,\-]+?)\s*\n(?:JL|JALAN|KP|KEL|KEC|KOTA|DESA|RT|RW|BLOK|NO)', text, re.IGNORECASE)
+    if nm:
+        nama = nm.group(1).strip()
+    else:
+        # Fallback: cari baris ALL CAPS setelah cabang
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if re.match(r'^REKENING (?:GIRO|TABUNGAN)', line.strip(), re.IGNORECASE):
+                # Baris berikutnya biasanya cabang, baris setelahnya nama
+                if i + 2 < len(lines):
+                    candidate = lines[i+2].strip()
+                    if candidate and candidate.isupper() and len(candidate) > 3 and not re.match(r'^(JL|JALAN|KP|KEL|NO\.|HALAMAN)', candidate):
+                        nama = candidate
+                        break
+
+    # --- Cabang ---
+    cabang = "(Tidak ditemukan)"
+    cm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n([^\n]+)', text, re.IGNORECASE)
+    if cm:
+        cabang = cm.group(1).strip()
+
+    # --- No Rekening ---
+    no_rek = "(Tidak ditemukan)"
+    rm = re.search(r'NO\.?\s*REKENING\s*[:\s]*(\d+)', text, re.IGNORECASE)
+    if rm:
+        no_rek = rm.group(1)
+
+    # --- Periode ---
+    bulan_str = "(Tidak ditemukan)"
+    tahun_str = "(Tidak ditemukan)"
+    pm = re.search(r'PERIODE\s*[:\s]*([A-Za-z]+)\s+(\d{4})', text, re.IGNORECASE)
+    if pm:
+        bulan_raw = pm.group(1).upper()
+        bulan_str = BULAN_TEXT_MAP.get(bulan_raw, pm.group(1).capitalize())
+        tahun_str = pm.group(2)
+
+    # --- Saldo & Mutasi ---
+    saldo_awal = total_debet = total_kredit = saldo_akhir = 0.0
+
+    # Cari area SALDO AWAL sampai SALDO AKHIR (biasanya di halaman terakhir)
+    # Format yang mungkin muncul:
+    # SALDO AWAL : -2,481,317,420.55
+    # MUTASI CR : 933,927,258.00
+    # MUTASI DB : 939,456,903.51
+    # SALDO AKHIR : -2,486,847,066.06
+    # ATAU format berantakan:
+    # SALDO AWAL : MUTASI CR MUTASI DB : : SALDO AKHIR :-2,481,317,420.55 933,927,258.00 939,456,903.51-2,486,847,066.06
+
+    # Cari semua angka desimal (format US: 1,234.56 atau -1,234.56) di area saldo
+    saldo_area_match = re.search(r'SALDO AWAL.*?SALDO AKHIR\s*[:\-]*\s*([\d\.,\-]+)', text, re.IGNORECASE | re.DOTALL)
+    if saldo_area_match:
+        saldo_area = saldo_area_match.group(0)
+        # Ekstrak semua angka dengan format US (dengan koma ribuan dan titik desimal)
+        # Pattern: optional minus, digits with commas, dot, 2 decimal digits
+        numbers = re.findall(r'-?[\d,]+\.\d{2}', saldo_area)
+        if len(numbers) >= 4:
+            saldo_awal   = parse_rp_us(numbers[0])
+            total_kredit = parse_rp_us(numbers[1])  # Mutasi CR
+            total_debet  = parse_rp_us(numbers[2])  # Mutasi DB
+            saldo_akhir  = parse_rp_us(numbers[3])
+        elif len(numbers) == 3:
+            # Kadang saldo awal tidak ikut tertangkap
+            total_kredit = parse_rp_us(numbers[0])
+            total_debet  = parse_rp_us(numbers[1])
+            saldo_akhir  = parse_rp_us(numbers[2])
+
+    # Fallback: cari per-label jika cara di atas gagal
+    if saldo_awal == 0 and total_debet == 0:
+        sa = re.search(r'SALDO AWAL\s*[:\s]*(-?[\d,]+\.\d{2})', text, re.IGNORECASE)
+        mc = re.search(r'MUTASI CR\s*[:\s]*(-?[\d,]+\.\d{2})', text, re.IGNORECASE)
+        md = re.search(r'MUTASI DB\s*[:\s]*(-?[\d,]+\.\d{2})', text, re.IGNORECASE)
+        sa2 = re.search(r'SALDO AKHIR\s*[:\s]*(-?[\d,]+\.\d{2})', text, re.IGNORECASE)
+        if sa: saldo_awal = parse_rp_us(sa.group(1))
+        if mc: total_kredit = parse_rp_us(mc.group(1))
+        if md: total_debet = parse_rp_us(md.group(1))
+        if sa2: saldo_akhir = parse_rp_us(sa2.group(1))
+
+    return {
+        "Nama": nama,
+        "Bulan": bulan_str,
+        "Tahun": tahun_str,
+        "Saldo Awal (Opening Balance)": fmt_rp_id(saldo_awal),
+        "Total Transaksi Debet (Total Debit Transaction)": fmt_rp_id(total_debet),
+        "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp_id(total_kredit),
+        "Saldo Akhir (Closing Balance)": fmt_rp_id(saldo_akhir),
+        "_saldo_awal_num": saldo_awal,
+        "_total_debet_num": total_debet,
+        "_total_kredit_num": total_kredit,
+        "_saldo_akhir_num": saldo_akhir,
+        "Nama File PDF": pdf_name,
+    }
+
 
 # =========================================================
 # 3️⃣  FUNGSI FILTER SLIK → KEMBALIKAN BYTESIO (BUKAN SAVE KE FOLDER)
@@ -307,10 +419,6 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     total_debet  = df_mutasi["_total_debet_num"].sum()
     total_kredit = df_mutasi["_total_kredit_num"].sum()
     total_saldo_akhir = df_mutasi["_saldo_akhir_num"].sum()
-
-    def fmt_rp_id(v):
-        """Format float → Indonesian: 151.847,00"""
-        return f"{v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
     total_row = {
         "Nama": "TOTAL",
@@ -455,7 +563,7 @@ if mode == "📊 Rekap SLIK":
 # ===========================================================
 else:
     st.subheader("🏦 Rekap Mutasi Rekening")
-    st.write("Unggah satu atau beberapa file PDF mutasi rekening BRI (format BRISIM).")
+    st.write("Unggah satu atau beberapa file PDF mutasi rekening (mendukung format **BCA** & **BRI**).")
 
     uploaded_files = st.file_uploader(
         "Tarik & lepaskan file PDF Mutasi Rekening di sini",
