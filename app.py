@@ -245,7 +245,6 @@ def extract_mutasi_panin(text, pdf_name):
     if nm:
         nama = nm.group(1).strip()
     else:
-        # Fallback: cari dari Account
         am = re.search(r'Account\s*:\s*\d+\s+([A-Z][A-Z\s,\.\-]+?)(?:\n|$)', text, re.IGNORECASE)
         if am:
             nama = am.group(1).strip()
@@ -262,14 +261,13 @@ def extract_mutasi_panin(text, pdf_name):
     if cm:
         cabang = cm.group(2).strip()
     
-    # --- Periode (dari halaman, ambil dari tanggal transaksi pertama dan terakhir) ---
+    # --- Periode ---
     bulan_str = "(Tidak ditemukan)"
     tahun_str = "(Tidak ditemukan)"
     
     # Cari semua tanggal dalam format DD MMM YY
     dates = re.findall(r'(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})', text, re.IGNORECASE)
     if dates:
-        # Ambil tanggal terakhir untuk periode
         last_date = dates[-1]
         date_parts = last_date.split()
         if len(date_parts) >= 3:
@@ -277,16 +275,17 @@ def extract_mutasi_panin(text, pdf_name):
             bulan_str = BULAN_TEXT_MAP.get(bulan_raw, bulan_raw.capitalize())
             tahun_str = '20' + date_parts[2]
     
-    # --- Ekstrak Transaksi (semua halaman) ---
+    # --- Ekstrak Transaksi ---
     transactions = []
     
-    # Pattern untuk transaksi Panin
-    # Format: Book Date Reference Description Value Date Debit Credit Closing Balance
-    # Contoh: 06 AUG 24 FT2421999HGJ\BNK TRANSFER MASUK BIFAST 06 AUG 24 1,000,000.00 1,000,000.00
+    # Pattern untuk menangkap transaksi dengan format yang berantakan
+    # Contoh: "06 AUG 24 FT2421999HGJ\BN KTRANSFER MASUK BIFAST06 AUG 24  1,000,000.00 1,000,000.00"
     
-    # Cari semua transaksi dengan pola yang lebih fleksibel
+    # Cari semua transaksi dengan pola yang lebih baik
+    # Pola: Tanggal Buku + Referensi + Deskripsi + Tanggal Nilai + Angka
     lines = text.splitlines()
     i = 0
+    
     while i < len(lines):
         line = lines[i].strip()
         
@@ -294,164 +293,210 @@ def extract_mutasi_panin(text, pdf_name):
         date_match = re.match(r'^(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})', line, re.IGNORECASE)
         if date_match:
             book_date = date_match.group(1)
-            # Ambil referensi (biasanya setelah tanggal)
-            ref_match = re.search(r'^' + re.escape(book_date) + r'\s+([^\s]+)', line, re.IGNORECASE)
+            
+            # Ambil sisa baris setelah tanggal
+            remaining = line[len(book_date):].strip()
+            
+            # Cari referensi (biasanya diawali FT atau kode lain)
+            ref_match = re.match(r'^([A-Z0-9\\]+)\s*', remaining)
             ref = ref_match.group(1) if ref_match else ""
             
-            # Ambil deskripsi - bisa multi-line
-            desc_parts = []
-            j = i
-            # Cari sampai menemukan format tanggal nilai atau angka
-            while j < len(lines):
-                current = lines[j].strip()
-                # Cek apakah ini baris tanggal nilai (DD MMM YY diikuti angka)
-                if re.match(r'^(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})\s+[\d\.,]+', current, re.IGNORECASE):
-                    break
-                # Jika sudah melewati 5 baris tanpa ketemu, stop
-                if j - i > 5:
-                    break
-                if current and not re.match(r'^Page\s+\d+', current, re.IGNORECASE):
-                    desc_parts.append(current)
-                j += 1
+            # Sisa setelah referensi adalah deskripsi + tanggal nilai + angka
+            desc_part = remaining[len(ref):].strip() if ref else remaining
             
-            desc = " ".join(desc_parts).strip()
-            # Bersihkan deskripsi dari referensi berlebih
-            desc = re.sub(r'^' + re.escape(ref) + r'\s*', '', desc)
+            # Cari tanggal nilai di dalam desc_part
+            value_date_match = re.search(r'(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})', desc_part, re.IGNORECASE)
             
-            # Cari nilai transaksi di baris berikutnya
             value_date = ""
-            debit = ""
-            credit = ""
-            closing_balance = ""
+            desc = desc_part
             
-            # Cari di baris selanjutnya
-            if j < len(lines):
-                value_line = lines[j].strip()
-                # Format: DD MMM YY Debit Kredit Closing Balance
-                value_parts = re.findall(r'[\d\.,]+', value_line)
-                
-                # Cari tanggal nilai
-                vd_match = re.match(r'^(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})', value_line, re.IGNORECASE)
-                if vd_match:
-                    value_date = vd_match.group(1)
-                
-                # Ambil angka (debit, credit, closing balance)
-                numbers = re.findall(r'[\d\.,]+', value_line)
-                if len(numbers) >= 3:
-                    # Cari tahu mana debit dan kredit berdasarkan posisi
-                    # Biasanya format: Value Date Debit Credit Closing Balance
-                    # Untuk transaksi masuk (kredit): debit = -, credit = angka, closing = angka
-                    # Untuk transaksi keluar (debit): debit = angka, credit = -, closing = angka
-                    if '-' in value_line or len(numbers) == 4:
-                        # Format dengan tanda minus atau 4 angka
-                        if len(numbers) >= 4:
-                            if numbers[0] == '-' or numbers[0] == '':
-                                debit = "-"
-                                credit = numbers[1]
-                                closing_balance = numbers[2]
-                            else:
-                                debit = numbers[0]
-                                credit = numbers[1]
-                                closing_balance = numbers[2]
+            if value_date_match:
+                value_date = value_date_match.group(1)
+                # Ambil deskripsi sebelum tanggal nilai
+                desc = desc_part[:value_date_match.start()].strip()
+                # Ambil angka setelah tanggal nilai
+                after_value = desc_part[value_date_match.end():].strip()
+            else:
+                # Jika tidak ada tanggal nilai di baris yang sama, cek baris berikutnya
+                after_value = ""
+                if i + 1 < len(lines):
+                    next_line = lines[i+1].strip()
+                    vd_match = re.search(r'^(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})', next_line, re.IGNORECASE)
+                    if vd_match:
+                        value_date = vd_match.group(1)
+                        after_value = next_line[len(value_date):].strip()
+                        # Gabungkan deskripsi dengan baris berikutnya jika perlu
+                        if len(desc) < 10:
+                            desc = desc + " " + next_line[:vd_match.start()].strip()
+            
+            # Ekstrak angka dari after_value
+            debit = "-"
+            credit = "-"
+            closing_balance = "-"
+            
+            # Cari semua angka dengan format Indonesia (1.000.000,00) atau US (1,000,000.00)
+            numbers = re.findall(r'[\d\.,]+', after_value)
+            
+            # Filter angka yang valid (bukan tanggal)
+            valid_numbers = []
+            for num in numbers:
+                # Cek apakah ini angka (bukan tanggal)
+                if not re.match(r'^\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2}$', num, re.IGNORECASE):
+                    try:
+                        # Coba parse sebagai angka
+                        if '.' in num and ',' in num:
+                            # Format Indonesia: 1.000.000,00
+                            val = parse_rp_id(num)
+                        elif ',' in num and '.' in num:
+                            # Format US: 1,000,000.00
+                            val = parse_rp_us(num)
+                        elif '.' in num:
+                            # Mungkin format Indonesia tanpa koma ribuan
+                            val = float(num.replace('.', ''))
+                        elif ',' in num:
+                            val = float(num.replace(',', '.'))
                         else:
-                            # Coba deteksi dari konteks
-                            for num in numbers:
-                                if parse_rp_id(num) > 0 and debit == "":
-                                    debit = num
-                                elif parse_rp_id(num) > 0 and credit == "":
-                                    credit = num
+                            val = float(num)
+                        valid_numbers.append((num, val))
+                    except:
+                        pass
+            
+            # Tentukan debit, kredit, dan closing balance
+            # Berdasarkan konteks deskripsi
+            desc_upper = desc.upper()
+            
+            if 'TRANSFER MASUK' in desc_upper or 'MASUK' in desc_upper:
+                # Transaksi masuk = kredit
+                if len(valid_numbers) >= 2:
+                    credit = valid_numbers[0][0]
+                    closing_balance = valid_numbers[1][0] if len(valid_numbers) > 1 else valid_numbers[0][0]
+                elif len(valid_numbers) >= 1:
+                    credit = valid_numbers[0][0]
+                    closing_balance = valid_numbers[0][0]
+            elif 'TAX' in desc_upper or 'PAJAK' in desc_upper:
+                # Transaksi pajak = debit
+                if len(valid_numbers) >= 2:
+                    debit = valid_numbers[0][0]
+                    closing_balance = valid_numbers[1][0] if len(valid_numbers) > 1 else "-"
+                elif len(valid_numbers) >= 1:
+                    debit = valid_numbers[0][0]
+            elif 'PROFIT' in desc_upper or 'BAGI HASIL' in desc_upper:
+                # Profit = kredit
+                if len(valid_numbers) >= 2:
+                    credit = valid_numbers[0][0]
+                    closing_balance = valid_numbers[1][0] if len(valid_numbers) > 1 else "-"
+                elif len(valid_numbers) >= 1:
+                    credit = valid_numbers[0][0]
+            elif 'TRANSFER' in desc_upper or 'INVOICE' in desc_upper:
+                # Transfer keluar = debit
+                if len(valid_numbers) >= 3:
+                    debit = valid_numbers[0][0]
+                    # Coba tentukan mana kredit dan closing
+                    if len(valid_numbers) >= 3:
+                        # Jika ada 3 angka: debit, ?, closing
+                        # Cek apakah angka kedua adalah kredit (biasanya 0 atau -)
+                        if valid_numbers[1][1] == 0:
+                            credit = "-"
+                            closing_balance = valid_numbers[2][0]
+                        else:
+                            # Mungkin format: debit, credit, closing
+                            credit = valid_numbers[1][0] if len(valid_numbers) > 1 else "-"
+                            closing_balance = valid_numbers[2][0] if len(valid_numbers) > 2 else "-"
+                    elif len(valid_numbers) >= 2:
+                        debit = valid_numbers[0][0]
+                        closing_balance = valid_numbers[1][0] if len(valid_numbers) > 1 else "-"
+                elif len(valid_numbers) >= 2:
+                    debit = valid_numbers[0][0]
+                    closing_balance = valid_numbers[1][0]
+                elif len(valid_numbers) >= 1:
+                    debit = valid_numbers[0][0]
+            else:
+                # Default: coba tentukan berdasarkan posisi
+                if len(valid_numbers) >= 3:
+                    # Coba deteksi: jika angka pertama lebih kecil dari angka kedua, mungkin debit, kredit, closing
+                    if valid_numbers[0][1] < valid_numbers[1][1]:
+                        debit = valid_numbers[0][0]
+                        credit = valid_numbers[1][0]
+                        closing_balance = valid_numbers[2][0]
                     else:
-                        # Format sederhana: debit, credit, closing
-                        if len(numbers) >= 3:
-                            # Periksa apakah ini transaksi debit atau kredit
-                            # Jika ada kata "MASUK" di deskripsi, berarti kredit
-                            if 'MASUK' in desc.upper() or 'MASUK' in desc.upper():
-                                credit = numbers[0] if len(numbers) >= 1 else ""
-                                closing_balance = numbers[1] if len(numbers) >= 2 else ""
-                            else:
-                                debit = numbers[0] if len(numbers) >= 1 else ""
-                                credit = numbers[1] if len(numbers) >= 2 else ""
-                                closing_balance = numbers[2] if len(numbers) >= 3 else ""
+                        debit = valid_numbers[0][0]
+                        closing_balance = valid_numbers[1][0]
+                elif len(valid_numbers) >= 2:
+                    debit = valid_numbers[0][0]
+                    closing_balance = valid_numbers[1][0]
+                elif len(valid_numbers) >= 1:
+                    debit = valid_numbers[0][0]
             
-            # Jika belum dapat, coba pattern lain dengan regex
-            if not value_date or (not debit and not credit):
-                # Coba cari pola transaksi lengkap dengan regex
-                trans_pattern = re.compile(
-                    r'(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})'
-                    r'.*?([\d\.,]+)\s+([\d\.,]+)\s+([\d\.,]+)',
-                    re.IGNORECASE | re.DOTALL
-                )
-                # Cari dari posisi i sampai j
-                block = "\n".join(lines[i:j+3])
-                tm = trans_pattern.search(block)
-                if tm:
-                    value_date = tm.group(1)
-                    # Tentukan mana debit dan kredit
-                    num1 = tm.group(2)
-                    num2 = tm.group(3)
-                    num3 = tm.group(4)
-                    # Logika: jika deskripsi mengandung "MASUK" atau "Kredit", maka kredit = num1
-                    if 'MASUK' in desc.upper() or 'KREDIT' in desc.upper() or 'PROFIT' in desc.upper():
-                        credit = num1
-                        debit = "-"
-                        closing_balance = num2 if num2 else num3
-                    elif 'TAX' in desc.upper() or 'DEBIT' in desc.upper():
-                        debit = num1
-                        credit = "-"
-                        closing_balance = num2
-                    else:
-                        # Default: debit di posisi pertama
-                        debit = num1
-                        credit = num2 if num2 else "-"
-                        closing_balance = num3 if num3 else ""
+            # Bersihkan deskripsi dari kode yang tidak perlu
+            desc = re.sub(r'\\[A-Z]+\s*', ' ', desc)  # Hapus \BNK dll
+            desc = re.sub(r'\s+', ' ', desc).strip()
             
-            # Format nilai dengan tanda minus jika perlu
-            # Pastikan closing balance memiliki tanda minus jika negatif
-            if closing_balance and not closing_balance.startswith('-'):
-                # Cek apakah closing balance negatif dari konteks
-                if parse_rp_id(closing_balance) < 0:
-                    closing_balance = "-" + closing_balance
-            
-            # Format debit dan credit
-            if debit and debit != "-" and parse_rp_id(debit) > 0:
-                debit = fmt_rp_id(parse_rp_id(debit))
-            elif debit == "-":
-                debit = "-"
-            elif debit:
-                debit = fmt_rp_id(parse_rp_id(debit))
-            
-            if credit and credit != "-" and parse_rp_id(credit) > 0:
-                credit = fmt_rp_id(parse_rp_id(credit))
-            elif credit == "-":
-                credit = "-"
-            elif credit:
-                credit = fmt_rp_id(parse_rp_id(credit))
-            
-            # Bersihkan closing balance
-            if closing_balance:
+            # Format nilai dengan benar
+            if debit and debit != "-":
                 try:
-                    cb_val = parse_rp_id(closing_balance)
-                    if cb_val < 0:
-                        closing_balance = "-" + fmt_rp_id(abs(cb_val))
+                    # Coba parse sesuai format
+                    if '.' in debit and ',' in debit:
+                        val = parse_rp_id(debit)
+                    elif ',' in debit:
+                        val = float(debit.replace(',', ''))
                     else:
-                        closing_balance = fmt_rp_id(cb_val)
+                        val = float(debit)
+                    debit = fmt_rp_id(val)
                 except:
                     pass
             
-            # Tambahkan ke transaksi
-            if debit or credit:
+            if credit and credit != "-":
+                try:
+                    if '.' in credit and ',' in credit:
+                        val = parse_rp_id(credit)
+                    elif ',' in credit:
+                        val = float(credit.replace(',', ''))
+                    else:
+                        val = float(credit)
+                    credit = fmt_rp_id(val)
+                except:
+                    pass
+            
+            if closing_balance and closing_balance != "-":
+                try:
+                    if '.' in closing_balance and ',' in closing_balance:
+                        val = parse_rp_id(closing_balance)
+                    elif ',' in closing_balance:
+                        val = float(closing_balance.replace(',', ''))
+                    else:
+                        val = float(closing_balance)
+                    # Tentukan apakah negatif
+                    if ' -' in after_value or '- ' in after_value or val < 0:
+                        closing_balance = "-" + fmt_rp_id(abs(val))
+                    else:
+                        closing_balance = fmt_rp_id(val)
+                except:
+                    pass
+            
+            # Hanya tambahkan jika ada transaksi yang valid
+            if debit != "-" or credit != "-":
                 transactions.append({
                     "Book Date": book_date,
-                    "Value Date": value_date,
-                    "Deskripsi": desc[:200],  # Batasi panjang deskripsi
-                    "Debit": debit if debit else "-",
-                    "Kredit": credit if credit else "-",
-                    "Closing Balance": closing_balance if closing_balance else "-"
+                    "Value Date": value_date if value_date else book_date,
+                    "Deskripsi": desc[:300] if desc else f"Transaksi {book_date}",
+                    "Debit": debit,
+                    "Kredit": credit,
+                    "Closing Balance": closing_balance
                 })
         
         i += 1
     
-    # --- Ambil Saldo Awal dari teks ---
+    # --- Hapus transaksi duplikat berdasarkan deskripsi dan tanggal ---
+    seen = set()
+    unique_transactions = []
+    for t in transactions:
+        key = (t['Value Date'], t['Deskripsi'][:50], t['Debit'], t['Kredit'])
+        if key not in seen:
+            seen.add(key)
+            unique_transactions.append(t)
+    transactions = unique_transactions
+    
+    # --- Ambil Saldo Awal ---
     saldo_awal = 0.0
     sa_match = re.search(r'Balance at Period\s*S\s*tart\s*([\d\.,]+)', text, re.IGNORECASE)
     if sa_match:
@@ -463,20 +508,25 @@ def extract_mutasi_panin(text, pdf_name):
     if pl_match:
         plafond = parse_rp_id(pl_match.group(1))
     
-    # --- Hitung total debit dan kredit dari transaksi ---
+    # --- Hitung total debit dan kredit ---
     total_debet = 0.0
     total_kredit = 0.0
     
     for t in transactions:
         if t['Debit'] != '-':
-            total_debet += parse_rp_id(t['Debit'])
+            try:
+                total_debet += parse_rp_id(t['Debit'])
+            except:
+                pass
         if t['Kredit'] != '-':
-            total_kredit += parse_rp_id(t['Kredit'])
+            try:
+                total_kredit += parse_rp_id(t['Kredit'])
+            except:
+                pass
     
     # Saldo akhir = saldo awal + total_kredit - total_debet
     saldo_akhir = saldo_awal + total_kredit - total_debet
     
-    # --- Kembalikan hasil ---
     return {
         "Nama": nama,
         "No Rekening": no_rek,
@@ -492,7 +542,7 @@ def extract_mutasi_panin(text, pdf_name):
         "_total_debet_num": total_debet,
         "_total_kredit_num": total_kredit,
         "_saldo_akhir_num": saldo_akhir,
-        "_transactions": transactions,  # Untuk detail transaksi
+        "_transactions": transactions,
         "Nama File PDF": pdf_name,
     }
 
