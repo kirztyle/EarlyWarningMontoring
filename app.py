@@ -33,14 +33,9 @@ def read_pdf_text(pdf_bytes, last_page_only=False):
     """
     Membaca teks dari PDF bytes. 
     Menangani PDF yang terenkripsi (termasuk null encryption / AES).
-    
-    Args:
-        pdf_bytes: Bytes dari file PDF
-        last_page_only: Jika True, hanya membaca halaman terakhir saja
     """
     reader = PdfReader(BytesIO(pdf_bytes))
     
-    # Handle PDF terenkripsi
     if reader.is_encrypted:
         try:
             reader.decrypt("")
@@ -53,12 +48,10 @@ def read_pdf_text(pdf_bytes, last_page_only=False):
     
     text = ""
     if last_page_only and len(reader.pages) > 0:
-        # Hanya baca halaman terakhir
         page_text = reader.pages[-1].extract_text()
         if page_text:
             text = page_text
     else:
-        # Baca semua halaman
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
@@ -68,12 +61,29 @@ def read_pdf_text(pdf_bytes, last_page_only=False):
 
 
 # =========================================================
-# 1️⃣  FUNGSI EKSTRAKSI SLIK
+# 🔧 FUNGSI BARU: Deteksi & Ekstraksi Nama (Individu & Perusahaan)
 # =========================================================
-def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
-    text = read_pdf_text(pdf_bytes, last_page_only=False)
+def detect_and_extract_nama(text):
+    """
+    Deteksi apakah PDF SLIK Individu atau Perusahaan, lalu ekstrak nama.
+    Mengembalikan (nama, jenis_debitur) dimana jenis_debitur = 'individu' | 'perusahaan'
+    """
+    header_text = text[:3000].upper()
+    has_npwp = 'NPWP' in header_text
+    has_nik = bool(re.search(r'\bNIK\s*/', header_text))
+    
+    is_perusahaan = has_npwp and not has_nik
+    
+    if is_perusahaan:
+        nama = extract_nama_perusahaan(text)
+        return nama, 'perusahaan'
+    else:
+        nama = extract_nama_individu(text)
+        return nama, 'individu'
 
-    # --- Nama ---
+
+def extract_nama_individu(text):
+    """Ekstraksi nama untuk SLIK Individu (logika lama)"""
     nama = "(Tidak ditemukan)"
     nama_match = re.search(r'([A-Z][A-Z\s]+)\nNIK\s*/\s*\n(\d{16})', text)
     if nama_match:
@@ -90,12 +100,130 @@ def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
         m = re.search(r'\b(SOLEHUDIN|[A-Z]{3,}(?:\s+[A-Z]{2,})+)\b', text)
         if m:
             nama = m.group(1).strip()
+    return nama
 
-    # --- NIK ---
+
+def extract_nama_perusahaan(text):
+    """
+    Ekstraksi nama perusahaan (Badan Usaha) dari teks SLIK.
+    
+    Strategi:
+    1. Cari semua baris yang merupakan nama bank pelapor (pola: "PT ... / DD Bulan YYYY" atau "... Finance / DD Bulan YYYY")
+    2. Nama perusahaan biasanya muncul tepat SEBELUM baris nama bank tersebut
+    3. Filter: buang baris yang merupakan alamat, kode pos, atau bagian dari "Bentuk BU"
+    """
+    lines = text.splitlines()
+    
+    # Pola untuk mendeteksi baris nama bank pelapor
+    # Contoh: "PT Bank Central Asia Tbk / 11 Juni 2026"
+    #         "PT Mandiri Tunas Finance / 10 Juni 2026"
+    #         "PT Astra Sedaya Finance / 11 Juni 2026"
+    bank_pattern = re.compile(
+        r'^(PT\s+[A-Z][A-Za-z\s\.\,]+(?:Tbk|Finance|Multifinance|Indonesia|BNI|BRI|Mandiri|OCBC|BCA|Panin|Danamon|CIMB|Permata|BTPN|Bukopin|Sinarmas|Niaga|Maybank|UOB|HSBC|Citibank|Standard Chartered|ANZ|DBS|NISP|BII|BTN|BJB|BPD|BPR|BNI|BRI|Bank)\s*/\s*\d{1,2}\s+\w+\s+\d{4})',
+        re.IGNORECASE
+    )
+    
+    # Kata kunci yang menandakan baris BUKAN nama (alamat, kode pos, bentuk BU, dll)
+    bukan_nama_pattern = re.compile(
+        r'(KAB\.?|KOTA|KEC\.?|KEL\.?|DESA|RT\.?\s*\d|RW\.?\s*\d|JL\.?|JALAN|INDONESIA|'
+        r'KODE POS|KODEPOS|\d{5}|'
+        r'COMMANDITER|PERSEROAN|GO PUBLIC|BENTUK BU|BENTUHBADANUSAHA|'
+        r'PELAPOR|TANGGAL UPDATE|NAMA DEBITUR|ALAMAT|KELURAHAN|KECAMATAN|'
+        r'NPWP|TEMPAT PENDIRIAN|TANGGAL AKTE|NO/TGL AKTA|PEMERINGKAT|'
+        r'BIDANG USAHA|PEMILIK|PENGURUS|OPERATOR|KODE REF|POSISI DATA|'
+        r'LJK|PERUNTUKAN|TANGGAL DIBENTUK|HALAMAN|RAHASIA|INFORMASI DEBITUR|'
+        r'JAWA BARAT|JAWA TIMUR|JAWA TENGAH|DKI JAKARTA|SUMATERA|BALI|KALIMANTAN|SULAWESI)',
+        re.IGNORECASE
+    )
+    
+    # Cari semua indeks baris yang merupakan nama bank pelapor
+    bank_indices = []
+    for i, line in enumerate(lines):
+        if bank_pattern.match(line.strip()):
+            bank_indices.append(i)
+    
+    if not bank_indices:
+        # Fallback: cari nama setelah "Nama Debitur"
+        nm = re.search(r'Nama Debitur\s*\n([A-Z][A-Z\s\.\,\-\&\/]{3,}?)\s*\n', text)
+        if nm:
+            return nm.group(1).strip()
+        return "(Tidak ditemukan)"
+    
+    # Untuk setiap bank, lihat baris sebelumnya untuk mencari nama perusahaan
+    nama_candidates = []
+    for bank_idx in bank_indices:
+        # Cek 1-5 baris sebelum bank
+        for offset in range(1, 6):
+            idx = bank_idx - offset
+            if idx < 0:
+                continue
+            candidate = lines[idx].strip()
+            
+            # Skip baris kosong
+            if not candidate:
+                continue
+            
+            # Skip jika mengandung kata kunci alamat/bukan nama
+            if bukan_nama_pattern.search(candidate):
+                continue
+            
+            # Skip jika mengandung angka (kemungkinan kode pos, tanggal, dll)
+            if re.search(r'\d', candidate):
+                continue
+            
+            # Skip jika terlalu pendek
+            if len(candidate) < 3:
+                continue
+            
+            # Skip jika bukan huruf kapital semua (nama perusahaan biasanya kapital)
+            if not candidate.replace(' ', '').replace('-', '').replace('.', '').replace('&', '').replace('/', '').replace('(', '').replace(')', '').isupper():
+                continue
+            
+            # Skip jika mengandung kata "Tbk" atau "Finance" (itu nama bank)
+            if re.search(r'\b(Tbk|Finance|Bank|Multifinance)\b', candidate, re.IGNORECASE):
+                continue
+            
+            # Kandidat valid
+            nama_candidates.append(candidate)
+            break  # Ambil kandidat pertama yang valid untuk bank ini
+    
+    if not nama_candidates:
+        return "(Tidak ditemukan)"
+    
+    # Pilih nama yang paling sering muncul (karena nama perusahaan muncul berulang di setiap blok pelapor)
+    from collections import Counter
+    counter = Counter(nama_candidates)
+    most_common = counter.most_common(1)[0][0]
+    
+    return most_common
+
+
+# =========================================================
+# 1️⃣  FUNGSI EKSTRAKSI SLIK
+# =========================================================
+def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
+    text = read_pdf_text(pdf_bytes, last_page_only=False)
+
+    # --- Deteksi & Ekstraksi Nama (Individu/Perusahaan) ---
+    nama, jenis_debitur = detect_and_extract_nama(text)
+
+    # --- NIK / NPWP ---
     nik_npwp = "(Tidak ditemukan)"
-    nik_match = re.search(r'\b(\d{16})\b', text)
-    if nik_match:
-        nik_npwp = nik_match.group(1)
+    if jenis_debitur == 'perusahaan':
+        # Cari NPWP (15 digit) atau NPWP format dengan titik/garis
+        npwp_match = re.search(r'\b(\d{2}\.?\d{3}\.?\d{3}\.?\d{1}-?\d{3}\.?\d{3})\b', text)
+        if npwp_match:
+            nik_npwp = npwp_match.group(1)
+        else:
+            # Fallback: cari 15 digit berurutan
+            npwp_match = re.search(r'\b(\d{15})\b', text)
+            if npwp_match:
+                nik_npwp = npwp_match.group(1)
+    else:
+        # Cari NIK (16 digit)
+        nik_match = re.search(r'\b(\d{16})\b', text)
+        if nik_match:
+            nik_npwp = nik_match.group(1)
 
     # --- Blok kredit ---
     HEADER_MARKER = "Pelapor\nCabang\nBaki Debet\nTanggal Update"
@@ -171,6 +299,7 @@ def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
         records.append({
             "Nama Sesuai Identitas": nama,
             "NIK/NPWP": nik_npwp,
+            "Jenis Debitur": jenis_debitur,
             "Pelapor": pelapor,
             "Baki Debet": baki_debet,
             "Tanggal Update": tanggal_update,
@@ -215,19 +344,15 @@ def fmt_rp_id(v):
     return f"{v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
 def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
-    # Baca semua halaman dulu untuk deteksi bank
     text_all = read_pdf_text(pdf_bytes, last_page_only=False)
     
-    # Deteksi bank berdasarkan kata kunci
     is_bca = bool(re.search(r'REKENING GIRO|REKENING TABUNGAN|BCA|Laporan Mutasi Rekening', text_all, re.IGNORECASE))
     is_bri = bool(re.search(r'Statement Date|BRISIM|Opening Balance', text_all, re.IGNORECASE))
     is_panin = bool(re.search(r'Bank Panin Dubai Syariah|Account Statement|PINJAMAN REKENING KORAN', text_all, re.IGNORECASE))
 
     if is_panin:
-        # Untuk Panin, baca semua halaman
         return extract_mutasi_panin(text_all, pdf_name)
     elif is_bca and not is_bri:
-        # Untuk BCA, baca hanya halaman terakhir
         text_last = read_pdf_text(pdf_bytes, last_page_only=True)
         return extract_mutasi_bca(text_all, text_last, pdf_name)
     else:
@@ -235,11 +360,7 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
 
 
 def extract_mutasi_panin(text, pdf_name):
-    """
-    Ekstraksi format Bank Panin Dubai Syariah
-    Dengan kolom: Deskripsi, Tanggal Nilai, Debit, Kredit, Closing Balance
-    """
-    # --- Nama Nasabah ---
+    """Ekstraksi format Bank Panin Dubai Syariah"""
     nama = "(Tidak ditemukan)"
     nm = re.search(r'Customer\s*:\s*\d+\s+([A-Z][A-Z\s,\.\-]+?)(?:\n|$)', text, re.IGNORECASE)
     if nm:
@@ -249,19 +370,16 @@ def extract_mutasi_panin(text, pdf_name):
         if am:
             nama = am.group(1).strip()
     
-    # --- No Rekening ---
     no_rek = "(Tidak ditemukan)"
     rm = re.search(r'Account\s*:\s*(\d+)\s+', text, re.IGNORECASE)
     if rm:
         no_rek = rm.group(1)
     
-    # --- Cabang ---
     cabang = "(Tidak ditemukan)"
     cm = re.search(r'Account Statement\s+(\d+)\s*-\s*KC\s+([A-Z\s]+)', text, re.IGNORECASE)
     if cm:
         cabang = cm.group(2).strip()
     
-    # --- Periode ---
     bulan_str = "(Tidak ditemukan)"
     tahun_str = "(Tidak ditemukan)"
     
@@ -274,47 +392,33 @@ def extract_mutasi_panin(text, pdf_name):
             bulan_str = BULAN_TEXT_MAP.get(bulan_raw, bulan_raw.capitalize())
             tahun_str = '20' + date_parts[2]
     
-    # --- Ekstrak Transaksi dengan pendekatan lebih akurat ---
     transactions = []
-    
-    # Pattern untuk menangkap transaksi dengan format yang berantakan
-    # Contoh: "06 AUG 24 FT2421999HGJ\BN KTRANSFER MASUK BIFAST06 AUG 24  1,000,000.00 1,000,000.00"
-    #         "16 AUG 24 FT24229BC806\BNK Transfer 16 AUG 24 136,270,080.00 -135,270,080.00"
-    
-    # Cari semua baris yang mengandung transaksi
     lines = text.splitlines()
     i = 0
     
     while i < len(lines):
         line = lines[i].strip()
         
-        # Cari baris yang dimulai dengan tanggal (DD MMM YY)
         date_match = re.match(r'^(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})', line, re.IGNORECASE)
         if date_match:
             book_date = date_match.group(1)
             remaining = line[len(book_date):].strip()
             
-            # Cari referensi (FT... atau kode lain)
             ref_match = re.match(r'^([A-Z0-9\\]+)\s*', remaining)
             ref = ref_match.group(1) if ref_match else ""
             
-            # Sisa setelah referensi
             desc_part = remaining[len(ref):].strip() if ref else remaining
             
-            # Cari tanggal nilai di desc_part
             value_date_match = re.search(r'(\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2})', desc_part, re.IGNORECASE)
             
-            value_date = book_date  # default
+            value_date = book_date
             desc = desc_part
             
             if value_date_match:
                 value_date = value_date_match.group(1)
-                # Ambil deskripsi sebelum tanggal nilai
                 desc = desc_part[:value_date_match.start()].strip()
-                # Ambil setelah tanggal nilai (angka-angka)
                 after_value = desc_part[value_date_match.end():].strip()
             else:
-                # Cek baris berikutnya untuk tanggal nilai
                 after_value = ""
                 if i + 1 < len(lines):
                     next_line = lines[i+1].strip()
@@ -322,43 +426,31 @@ def extract_mutasi_panin(text, pdf_name):
                     if vd_match:
                         value_date = vd_match.group(1)
                         after_value = next_line[len(value_date):].strip()
-                        # Jika deskripsi pendek, gabung dengan baris berikutnya
                         if len(desc) < 5:
                             desc = desc + " " + next_line[:vd_match.start()].strip()
             
-            # Jika masih tidak ada after_value, cari di baris berikutnya
             if not after_value and i + 1 < len(lines):
                 next_line = lines[i+1].strip()
-                # Cek apakah baris berikutnya berisi angka
                 if re.search(r'[\d\.,]+\s+[\d\.,]+', next_line):
                     after_value = next_line
             
-            # Ekstrak angka dari after_value
             debit = "-"
             credit = "-"
             closing_balance = "-"
             
-            # Cari semua angka dengan format yang mungkin
-            # Format: 1,000,000.00 (US) atau 1.000.000,00 (ID)
             numbers = re.findall(r'-?[\d,]+\.\d{2}|-?[\d\.]+,\d{2}', after_value)
             
-            # Konversi ke float untuk analisis
             parsed_numbers = []
             for num in numbers:
                 try:
-                    # Deteksi format
                     if ',' in num and '.' in num:
                         if num.index(',') < num.index('.'):
-                            # Format US: 1,000,000.00
                             val = float(num.replace(',', ''))
                         else:
-                            # Format ID: 1.000.000,00
                             val = float(num.replace('.', '').replace(',', '.'))
                     elif ',' in num:
-                        # Mungkin format ID tanpa titik ribuan
                         val = float(num.replace(',', '.'))
                     elif '.' in num:
-                        # Mungkin format US tanpa koma ribuan
                         val = float(num)
                     else:
                         val = float(num)
@@ -366,40 +458,31 @@ def extract_mutasi_panin(text, pdf_name):
                 except:
                     pass
             
-            # Tentukan debit, kredit, closing balance berdasarkan konteks
             desc_upper = desc.upper()
             
             if len(parsed_numbers) >= 3:
-                # Ada 3 angka: debit, kredit, closing (atau debit, credit, closing)
-                # Cek apakah angka pertama negatif
                 if parsed_numbers[0][1] < 0:
-                    # Angka pertama negatif = debit
                     debit = parsed_numbers[0][0]
                     credit = parsed_numbers[1][0] if parsed_numbers[1][1] > 0 else "-"
                     closing_balance = parsed_numbers[2][0]
                 elif 'MASUK' in desc_upper or 'KREDIT' in desc_upper:
-                    # Transaksi masuk = kredit
                     credit = parsed_numbers[0][0]
                     debit = "-"
                     closing_balance = parsed_numbers[1][0] if len(parsed_numbers) > 1 else "-"
                 elif 'TAX' in desc_upper or 'PAJAK' in desc_upper:
-                    # Pajak = debit
                     debit = parsed_numbers[0][0]
                     credit = "-"
                     closing_balance = parsed_numbers[1][0] if len(parsed_numbers) > 1 else "-"
                 elif 'PROFIT' in desc_upper or 'BAGI HASIL' in desc_upper:
-                    # Profit = kredit
                     credit = parsed_numbers[0][0]
                     debit = "-"
                     closing_balance = parsed_numbers[1][0] if len(parsed_numbers) > 1 else "-"
                 else:
-                    # Default: transfer keluar
                     debit = parsed_numbers[0][0]
                     credit = parsed_numbers[1][0] if len(parsed_numbers) > 1 and parsed_numbers[1][1] > 0 else "-"
                     closing_balance = parsed_numbers[2][0] if len(parsed_numbers) > 2 else "-"
             
             elif len(parsed_numbers) == 2:
-                # Ada 2 angka: biasanya debit/credit + closing
                 if 'MASUK' in desc_upper or 'KREDIT' in desc_upper:
                     credit = parsed_numbers[0][0]
                     closing_balance = parsed_numbers[1][0]
@@ -410,18 +493,15 @@ def extract_mutasi_panin(text, pdf_name):
                     credit = parsed_numbers[0][0]
                     closing_balance = parsed_numbers[1][0]
                 else:
-                    # Transfer keluar
                     debit = parsed_numbers[0][0]
                     closing_balance = parsed_numbers[1][0]
             
             elif len(parsed_numbers) == 1:
-                # Hanya 1 angka
                 if 'MASUK' in desc_upper:
                     credit = parsed_numbers[0][0]
                 else:
                     debit = parsed_numbers[0][0]
             
-            # Format ulang angka ke format Indonesia
             if debit and debit != "-":
                 try:
                     val = float(debit.replace(',', '')) if ',' in debit else float(debit)
@@ -438,7 +518,6 @@ def extract_mutasi_panin(text, pdf_name):
             
             if closing_balance and closing_balance != "-":
                 try:
-                    # Cek apakah negatif
                     is_negative = False
                     if '-' in closing_balance:
                         is_negative = True
@@ -452,14 +531,10 @@ def extract_mutasi_panin(text, pdf_name):
                 except:
                     pass
             
-            # Hanya tambahkan jika ada transaksi yang valid
             if debit != "-" or credit != "-":
-                # Bersihkan deskripsi
-                # Hapus referensi dan kode yang tidak perlu
                 desc = re.sub(r'\\[A-Z]+\s*', ' ', desc)
                 desc = re.sub(r'\s+', ' ', desc).strip()
                 
-                # Jika deskripsi kosong, beri nama berdasarkan jenis
                 if not desc:
                     if credit != "-":
                         desc = "TRANSFER MASUK"
@@ -468,18 +543,13 @@ def extract_mutasi_panin(text, pdf_name):
                     else:
                         desc = "TRANSAKSI"
                 
-                # Tambahkan informasi tambahan jika ada di baris berikutnya
-                # Cek baris berikutnya untuk info tambahan (Pengirim, To Acc, dll)
                 if i + 1 < len(lines):
                     next_line = lines[i+1].strip()
-                    # Jika baris berikutnya bukan tanggal dan bukan angka saja
                     if not re.match(r'^\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{2}', next_line, re.IGNORECASE):
                         if not re.match(r'^[\d\.,\s-]+$', next_line):
-                            # Tambahkan info tambahan jika relevan
                             if 'Pengirim' in next_line or 'To Acc' in next_line or 'INVOICE' in next_line:
                                 desc = desc + " " + next_line[:100]
                 
-                # Bersihkan lagi
                 desc = re.sub(r'\s+', ' ', desc).strip()
                 
                 transactions.append({
@@ -493,7 +563,6 @@ def extract_mutasi_panin(text, pdf_name):
         
         i += 1
     
-    # --- Hapus transaksi duplikat ---
     seen = set()
     unique_transactions = []
     for t in transactions:
@@ -503,7 +572,6 @@ def extract_mutasi_panin(text, pdf_name):
             unique_transactions.append(t)
     transactions = unique_transactions
     
-    # --- Ambil Saldo Awal ---
     saldo_awal = 0.0
     sa_match = re.search(r'Balance at Period\s*S\s*tart\s*([\d\.,]+)', text, re.IGNORECASE)
     if sa_match:
@@ -512,7 +580,6 @@ def extract_mutasi_panin(text, pdf_name):
         except:
             saldo_awal = 0.0
     
-    # --- Ambil Plafond ---
     plafond = 0.0
     pl_match = re.search(r'Plafond\s*:\s*([\d\.,]+)', text, re.IGNORECASE)
     if pl_match:
@@ -521,7 +588,6 @@ def extract_mutasi_panin(text, pdf_name):
         except:
             plafond = 0.0
     
-    # --- Hitung total debit dan kredit dari transaksi ---
     total_debet = 0.0
     total_kredit = 0.0
     
@@ -537,7 +603,6 @@ def extract_mutasi_panin(text, pdf_name):
             except:
                 pass
     
-    # Saldo akhir = saldo awal + total_kredit - total_debet
     saldo_akhir = saldo_awal + total_kredit - total_debet
     
     return {
@@ -561,13 +626,11 @@ def extract_mutasi_panin(text, pdf_name):
 
 def extract_mutasi_bri(text, pdf_name):
     """Ekstraksi format BRI (BRISIM)"""
-    # --- Nama nasabah ---
     nama = "(Tidak ditemukan)"
     nm = re.search(r'Statement Date\n:\n[\d/]+\n([A-Z][A-Z\s]+?)\s*\n', text)
     if nm:
         nama = nm.group(1).strip()
 
-    # --- Periode transaksi ---
     bulan_str = "(Tidak ditemukan)"
     tahun_str = "(Tidak ditemukan)"
     pm = re.search(
@@ -580,7 +643,6 @@ def extract_mutasi_bri(text, pdf_name):
         bulan_str = BULAN_MAP.get(parts[1], parts[1])
         tahun_str = '20' + parts[2]
 
-    # --- Saldo & transaksi ---
     saldo_awal = total_debet = total_kredit = saldo_akhir = 0.0
 
     sm = re.search(
@@ -616,15 +678,7 @@ def extract_mutasi_bri(text, pdf_name):
 
 
 def extract_mutasi_bca(text_all, text_last, pdf_name):
-    """
-    Ekstraksi format BCA (Rekening Giro/Tabungan)
-    
-    Args:
-        text_all: Teks dari semua halaman (untuk nama, cabang, periode)
-        text_last: Teks dari halaman terakhir saja (untuk saldo & mutasi)
-        pdf_name: Nama file PDF
-    """
-    # --- Nama nasabah (dari semua halaman) ---
+    """Ekstraksi format BCA (Rekening Giro/Tabungan)"""
     nama = "(Tidak ditemukan)"
     nm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n[^\n]+\n([A-Z][A-Z\s\.,\-]+?)\s*\n(?:JL|JALAN|KP|KEL|KEC|KOTA|DESA|RT|RW|BLOK|NO)', text_all, re.IGNORECASE)
     if nm:
@@ -639,19 +693,16 @@ def extract_mutasi_bca(text_all, text_last, pdf_name):
                         nama = candidate
                         break
 
-    # --- Cabang (dari semua halaman) ---
     cabang = "(Tidak ditemukan)"
     cm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n([^\n]+)', text_all, re.IGNORECASE)
     if cm:
         cabang = cm.group(1).strip()
 
-    # --- No Rekening (dari semua halaman) ---
     no_rek = "(Tidak ditemukan)"
     rm = re.search(r'NO\.?\s*REKENING\s*[:\s]*(\d+)', text_all, re.IGNORECASE)
     if rm:
         no_rek = rm.group(1)
 
-    # --- Periode (dari semua halaman) ---
     bulan_str = "(Tidak ditemukan)"
     tahun_str = "(Tidak ditemukan)"
     pm = re.search(r'PERIODE\s*[:\s]*([A-Za-z]+)\s+(\d{4})', text_all, re.IGNORECASE)
@@ -660,27 +711,22 @@ def extract_mutasi_bca(text_all, text_last, pdf_name):
         bulan_str = BULAN_TEXT_MAP.get(bulan_raw, pm.group(1).capitalize())
         tahun_str = pm.group(2)
 
-    # --- Saldo & Mutasi (HANYA dari halaman terakhir) ---
     saldo_awal = total_debet = total_kredit = saldo_akhir = 0.0
 
-    # Cari area SALDO AWAL sampai SALDO AKHIR di halaman terakhir
     saldo_area_match = re.search(r'SALDO AWAL.*?SALDO AKHIR\s*[:\-]*\s*([\d\.,\-]+)', text_last, re.IGNORECASE | re.DOTALL)
     if saldo_area_match:
         saldo_area = saldo_area_match.group(0)
-        # Ekstrak semua angka dengan format US (dengan koma ribuan dan titik desimal)
         numbers = re.findall(r'-?[\d,]+\.\d{2}', saldo_area)
         if len(numbers) >= 4:
             saldo_awal   = parse_rp_us(numbers[0])
-            total_kredit = parse_rp_us(numbers[1])  # Mutasi CR
-            total_debet  = parse_rp_us(numbers[2])  # Mutasi DB
+            total_kredit = parse_rp_us(numbers[1])
+            total_debet  = parse_rp_us(numbers[2])
             saldo_akhir  = parse_rp_us(numbers[3])
         elif len(numbers) == 3:
-            # Kadang saldo awal tidak ikut tertangkap
             total_kredit = parse_rp_us(numbers[0])
             total_debet  = parse_rp_us(numbers[1])
             saldo_akhir  = parse_rp_us(numbers[2])
 
-    # Fallback: cari per-label jika cara di atas gagal
     if saldo_awal == 0 and total_debet == 0:
         sa = re.search(r'SALDO AWAL\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
         mc = re.search(r'MUTASI CR\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
@@ -801,7 +847,6 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         df_total.to_excel(writer, index=False, sheet_name='Rekap Mutasi')
         
-        # Format angka
         ws = writer.sheets['Rekap Mutasi']
         for row in ws.iter_rows(min_row=2, min_col=6, max_col=10):
             for cell in row:
@@ -813,7 +858,6 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
                     except ValueError:
                         pass
         
-        # Auto width
         for col in ws.columns:
             max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
@@ -854,12 +898,11 @@ def build_panin_detail_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         df_detail.to_excel(writer, index=False, sheet_name='Detail Transaksi')
         
-        # Auto width
         ws = writer.sheets['Detail Transaksi']
         for col in ws.columns:
             max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
-    
+
     buf.seek(0)
     return buf
 
@@ -870,7 +913,6 @@ def build_panin_detail_excel(df_mutasi: pd.DataFrame) -> BytesIO:
 st.set_page_config(page_title="SLIK & Mutasi Extractor", page_icon="📄", layout="wide")
 st.title("📄 SLIK & Mutasi Rekening Extractor")
 
-# ---------- Pilihan Mode ----------
 mode = st.radio(
     "Pilih jenis dokumen yang akan diproses:",
     ["📊 Rekap SLIK", "🏦 Rekap Mutasi Rekening"],
@@ -884,7 +926,7 @@ st.markdown("---")
 # ===========================================================
 if mode == "📊 Rekap SLIK":
     st.subheader("📊 Rekap SLIK")
-    st.write("Unggah satu atau beberapa file PDF SLIK untuk diekstrak.")
+    st.write("Unggah satu atau beberapa file PDF SLIK untuk diekstrak. (Mendukung **SLIK Individu** & **SLIK Perusahaan/Badan Usaha**)")
 
     uploaded_files = st.file_uploader(
         "Tarik & lepaskan file PDF SLIK di sini",
@@ -912,6 +954,12 @@ if mode == "📊 Rekap SLIK":
         if all_data:
             df_all = pd.concat(all_data, ignore_index=True)
             st.success(f"✅ Berhasil memproses {len(uploaded_files)} file PDF!")
+
+            # Tampilkan info jenis debitur
+            if 'Jenis Debitur' in df_all.columns:
+                jenis_counts = df_all['Jenis Debitur'].value_counts()
+                info_text = " | ".join([f"{k.capitalize()}: {v} record" for k, v in jenis_counts.items()])
+                st.info(f"📋 **Jenis Debitur Terdeteksi:** {info_text}")
 
             with st.expander("👁️ Preview Data", expanded=True):
                 st.dataframe(df_all, use_container_width=True)
@@ -985,7 +1033,7 @@ else:
     if uploaded_files:
         results = []
         errors  = []
-        panin_files = []  # Untuk menyimpan file Panin yang berhasil diproses
+        panin_files = []
 
         with st.spinner("Memproses file mutasi... ⏳"):
             for uf in uploaded_files:
@@ -993,7 +1041,6 @@ else:
                     row = extract_mutasi_from_bytes(uf.read(), uf.name)
                     if row:
                         results.append(row)
-                        # Cek apakah ini file Panin (ada transaksi detail)
                         if row.get('_transactions'):
                             panin_files.append(row)
                 except Exception as e:
@@ -1007,7 +1054,6 @@ else:
             df_mutasi = pd.DataFrame(results)
             st.success(f"✅ Berhasil memproses {len(results)} file PDF!")
 
-            # Tampilkan informasi bank yang terdeteksi
             bank_counts = {}
             for r in results:
                 if r.get('_transactions'):
@@ -1070,7 +1116,6 @@ else:
             c3.metric("Total Kredit",  f"Rp {total_kredit:,.0f}")
             c4.metric("Total Saldo Akhir", f"Rp {total_saldo_akhir:,.0f}")
 
-            # Download Rekap Mutasi
             st.subheader("📥 Download Rekap Mutasi")
             excel_buf = build_mutasi_excel(df_mutasi)
             st.download_button(
@@ -1080,7 +1125,6 @@ else:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            # Jika ada file Panin, tampilkan opsi download detail transaksi
             if panin_files:
                 st.subheader("📥 Download Detail Transaksi (Bank Panin)")
                 st.info("💡 File ini berisi detail setiap transaksi dengan kolom: Deskripsi, Tanggal Nilai, Debit, Kredit, Closing Balance")
@@ -1094,9 +1138,7 @@ else:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
                     
-                    # Preview detail transaksi
                     with st.expander("👁️ Preview Detail Transaksi Panin"):
-                        # Ambil semua transaksi untuk preview
                         all_tx = []
                         for r in panin_files:
                             for t in r.get('_transactions', []):
@@ -1109,7 +1151,7 @@ else:
                                     "Closing Balance": t.get('Closing Balance', '-'),
                                 })
                         if all_tx:
-                            df_preview_tx = pd.DataFrame(all_tx[:20])  # Tampilkan 20 transaksi pertama
+                            df_preview_tx = pd.DataFrame(all_tx[:20])
                             st.dataframe(df_preview_tx, use_container_width=True, hide_index=True)
                             if len(all_tx) > 20:
                                 st.caption(f"*Menampilkan 20 dari {len(all_tx)} transaksi*")
