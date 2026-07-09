@@ -17,16 +17,61 @@ BULAN_MAP = {
     '09': 'September','10': 'Oktober', '11': 'November', '12': 'Desember'
 }
 
+BULAN_TEXT_MAP = {
+    'JANUARI': 'Januari', 'FEBRUARI': 'Februari', 'MARET': 'Maret', 'APRIL': 'April',
+    'MEI': 'Mei', 'JUNI': 'Juni', 'JULI': 'Juli', 'AGUSTUS': 'Agustus',
+    'SEPTEMBER': 'September', 'OKTOBER': 'Oktober', 'NOVEMBER': 'November', 'DESEMBER': 'Desember',
+    'JAN': 'Januari', 'FEB': 'Februari', 'MAR': 'Maret', 'APR': 'April',
+    'MAY': 'Mei', 'JUN': 'Juni', 'JUL': 'Juli', 'AUG': 'Agustus',
+    'SEP': 'September', 'OCT': 'Oktober', 'NOV': 'November', 'DEC': 'Desember'
+}
+
+# =========================================================
+# HELPER: Baca PDF (support enkripsi AES)
+# =========================================================
+def read_pdf_text(pdf_bytes, last_page_only=False):
+    """
+    Membaca teks dari PDF bytes. 
+    Menangani PDF yang terenkripsi (termasuk null encryption / AES).
+    
+    Args:
+        pdf_bytes: Bytes dari file PDF
+        last_page_only: Jika True, hanya membaca halaman terakhir saja
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    
+    # Handle PDF terenkripsi
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception as e:
+            raise ValueError(
+                f"PDF terenkripsi dan tidak bisa dibuka. "
+                f"Pastikan PyCryptodome sudah terinstall: `pip install PyCryptodome`. "
+                f"Error: {e}"
+            )
+    
+    text = ""
+    if last_page_only and len(reader.pages) > 0:
+        # Hanya baca halaman terakhir
+        page_text = reader.pages[-1].extract_text()
+        if page_text:
+            text = page_text
+    else:
+        # Baca semua halaman
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    
+    return text
+
+
 # =========================================================
 # 1️⃣  FUNGSI EKSTRAKSI SLIK
 # =========================================================
 def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
-    reader = PdfReader(BytesIO(pdf_bytes))
-    text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
+    text = read_pdf_text(pdf_bytes, last_page_only=False)
 
     # --- Nama ---
     nama = "(Tidak ditemukan)"
@@ -149,27 +194,45 @@ def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
 
 
 # =========================================================
-# 2️⃣  FUNGSI EKSTRAKSI MUTASI REKENING
+# 2️⃣  FUNGSI EKSTRAKSI MUTASI REKENING (MULTI-BANK: BRI & BCA)
 # =========================================================
-def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
-    """
-    Mengekstrak rekap mutasi rekening BRI (BRISIM) dari PDF.
-    Mengembalikan dict satu baris rekap per file, atau None jika gagal.
-    """
-    reader = PdfReader(BytesIO(pdf_bytes))
-    text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
+def parse_rp_us(s):
+    """Parse format US '151,847.00' → float 151847.00"""
+    try:
+        return float(str(s).replace(',', ''))
+    except Exception:
+        return 0.0
 
+def fmt_rp_id(v):
+    """Format float → string Rupiah format Indonesia: 151.847,00"""
+    return f"{v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+
+def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
+    # Baca semua halaman dulu untuk deteksi bank
+    text_all = read_pdf_text(pdf_bytes, last_page_only=False)
+    
+    # Deteksi bank berdasarkan kata kunci
+    is_bca = bool(re.search(r'REKENING GIRO|REKENING TABUNGAN|BCA|Laporan Mutasi Rekening', text_all, re.IGNORECASE))
+    is_bri = bool(re.search(r'Statement Date|BRISIM|Opening Balance', text_all, re.IGNORECASE))
+
+    if is_bca and not is_bri:
+        # Untuk BCA, baca hanya halaman terakhir
+        text_last = read_pdf_text(pdf_bytes, last_page_only=True)
+        # Tapi untuk nama dan periode, tetap perlu halaman pertama
+        return extract_mutasi_bca(text_all, text_last, pdf_name)
+    else:
+        return extract_mutasi_bri(text_all, pdf_name)
+
+
+def extract_mutasi_bri(text, pdf_name):
+    """Ekstraksi format BRI (BRISIM)"""
     # --- Nama nasabah ---
     nama = "(Tidak ditemukan)"
     nm = re.search(r'Statement Date\n:\n[\d/]+\n([A-Z][A-Z\s]+?)\s*\n', text)
     if nm:
         nama = nm.group(1).strip()
 
-    # --- Periode transaksi  (DD/MM/YY - DD/MM/YY) ---
+    # --- Periode transaksi ---
     bulan_str = "(Tidak ditemukan)"
     tahun_str = "(Tidak ditemukan)"
     pm = re.search(
@@ -177,24 +240,13 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         text
     )
     if pm:
-        # Ambil bulan & tahun dari tanggal MULAI periode
-        start = pm.group(1)           # DD/MM/YY
+        start = pm.group(1)
         parts = start.split('/')
         bulan_str = BULAN_MAP.get(parts[1], parts[1])
         tahun_str = '20' + parts[2]
 
-    # --- Saldo Awal, Total Debet, Total Kredit, Saldo Akhir ---
-    def parse_rp(s):
-        """Konversi string '151,847.00' ke float."""
-        try:
-            return float(s.replace(',', ''))
-        except Exception:
-            return 0.0
-
-    saldo_awal     = 0.0
-    total_debet    = 0.0
-    total_kredit   = 0.0
-    saldo_akhir    = 0.0
+    # --- Saldo & transaksi ---
+    saldo_awal = total_debet = total_kredit = saldo_akhir = 0.0
 
     sm = re.search(
         r'Saldo Awal\nOpening Balance\nTotal Transaksi Debet\nTotal Debit Transaction\n'
@@ -203,39 +255,123 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         text
     )
     if sm:
-        saldo_awal   = parse_rp(sm.group(1))
-        total_debet  = parse_rp(sm.group(2))
-        total_kredit = parse_rp(sm.group(3))
-        saldo_akhir  = parse_rp(sm.group(4))
-
-    def fmt_rp(v):
-        """Format float ke string Rupiah: 151,847.00"""
-        return f"{v:,.2f}"
+        saldo_awal   = parse_rp_us(sm.group(1))
+        total_debet  = parse_rp_us(sm.group(2))
+        total_kredit = parse_rp_us(sm.group(3))
+        saldo_akhir  = parse_rp_us(sm.group(4))
 
     return {
         "Nama": nama,
         "Bulan": bulan_str,
         "Tahun": tahun_str,
-        "Saldo Awal (Opening Balance)": fmt_rp(saldo_awal),
-        "Total Transaksi Debet (Total Debit Transaction)": fmt_rp(total_debet),
-        "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp(total_kredit),
-        "Saldo Akhir (Closing Balance)": fmt_rp(saldo_akhir),
-        # Nilai numerik untuk perhitungan baris total
-        "_saldo_awal_num":    saldo_awal,
-        "_total_debet_num":   total_debet,
-        "_total_kredit_num":  total_kredit,
-        "_saldo_akhir_num":   saldo_akhir,
+        "Saldo Awal (Opening Balance)": fmt_rp_id(saldo_awal),
+        "Total Transaksi Debet (Total Debit Transaction)": fmt_rp_id(total_debet),
+        "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp_id(total_kredit),
+        "Saldo Akhir (Closing Balance)": fmt_rp_id(saldo_akhir),
+        "_saldo_awal_num": saldo_awal,
+        "_total_debet_num": total_debet,
+        "_total_kredit_num": total_kredit,
+        "_saldo_akhir_num": saldo_akhir,
+        "Nama File PDF": pdf_name,
+    }
+
+
+def extract_mutasi_bca(text_all, text_last, pdf_name):
+    """
+    Ekstraksi format BCA (Rekening Giro/Tabungan)
+    
+    Args:
+        text_all: Teks dari semua halaman (untuk nama, cabang, periode)
+        text_last: Teks dari halaman terakhir saja (untuk saldo & mutasi)
+        pdf_name: Nama file PDF
+    """
+    # --- Nama nasabah (dari semua halaman) ---
+    nama = "(Tidak ditemukan)"
+    nm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n[^\n]+\n([A-Z][A-Z\s\.,\-]+?)\s*\n(?:JL|JALAN|KP|KEL|KEC|KOTA|DESA|RT|RW|BLOK|NO)', text_all, re.IGNORECASE)
+    if nm:
+        nama = nm.group(1).strip()
+    else:
+        lines = text_all.splitlines()
+        for i, line in enumerate(lines):
+            if re.match(r'^REKENING (?:GIRO|TABUNGAN)', line.strip(), re.IGNORECASE):
+                if i + 2 < len(lines):
+                    candidate = lines[i+2].strip()
+                    if candidate and candidate.isupper() and len(candidate) > 3 and not re.match(r'^(JL|JALAN|KP|KEL|NO\.|HALAMAN)', candidate):
+                        nama = candidate
+                        break
+
+    # --- Cabang (dari semua halaman) ---
+    cabang = "(Tidak ditemukan)"
+    cm = re.search(r'REKENING (?:GIRO|TABUNGAN)\s*\n([^\n]+)', text_all, re.IGNORECASE)
+    if cm:
+        cabang = cm.group(1).strip()
+
+    # --- No Rekening (dari semua halaman) ---
+    no_rek = "(Tidak ditemukan)"
+    rm = re.search(r'NO\.?\s*REKENING\s*[:\s]*(\d+)', text_all, re.IGNORECASE)
+    if rm:
+        no_rek = rm.group(1)
+
+    # --- Periode (dari semua halaman) ---
+    bulan_str = "(Tidak ditemukan)"
+    tahun_str = "(Tidak ditemukan)"
+    pm = re.search(r'PERIODE\s*[:\s]*([A-Za-z]+)\s+(\d{4})', text_all, re.IGNORECASE)
+    if pm:
+        bulan_raw = pm.group(1).upper()
+        bulan_str = BULAN_TEXT_MAP.get(bulan_raw, pm.group(1).capitalize())
+        tahun_str = pm.group(2)
+
+    # --- Saldo & Mutasi (HANYA dari halaman terakhir) ---
+    saldo_awal = total_debet = total_kredit = saldo_akhir = 0.0
+
+    # Cari area SALDO AWAL sampai SALDO AKHIR di halaman terakhir
+    saldo_area_match = re.search(r'SALDO AWAL.*?SALDO AKHIR\s*[:\-]*\s*([\d\.,\-]+)', text_last, re.IGNORECASE | re.DOTALL)
+    if saldo_area_match:
+        saldo_area = saldo_area_match.group(0)
+        # Ekstrak semua angka dengan format US (dengan koma ribuan dan titik desimal)
+        numbers = re.findall(r'-?[\d,]+\.\d{2}', saldo_area)
+        if len(numbers) >= 4:
+            saldo_awal   = parse_rp_us(numbers[0])
+            total_kredit = parse_rp_us(numbers[1])  # Mutasi CR
+            total_debet  = parse_rp_us(numbers[2])  # Mutasi DB
+            saldo_akhir  = parse_rp_us(numbers[3])
+        elif len(numbers) == 3:
+            # Kadang saldo awal tidak ikut tertangkap
+            total_kredit = parse_rp_us(numbers[0])
+            total_debet  = parse_rp_us(numbers[1])
+            saldo_akhir  = parse_rp_us(numbers[2])
+
+    # Fallback: cari per-label jika cara di atas gagal
+    if saldo_awal == 0 and total_debet == 0:
+        sa = re.search(r'SALDO AWAL\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
+        mc = re.search(r'MUTASI CR\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
+        md = re.search(r'MUTASI DB\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
+        sa2 = re.search(r'SALDO AKHIR\s*[:\s]*(-?[\d,]+\.\d{2})', text_last, re.IGNORECASE)
+        if sa: saldo_awal = parse_rp_us(sa.group(1))
+        if mc: total_kredit = parse_rp_us(mc.group(1))
+        if md: total_debet = parse_rp_us(md.group(1))
+        if sa2: saldo_akhir = parse_rp_us(sa2.group(1))
+
+    return {
+        "Nama": nama,
+        "Bulan": bulan_str,
+        "Tahun": tahun_str,
+        "Saldo Awal (Opening Balance)": fmt_rp_id(saldo_awal),
+        "Total Transaksi Debet (Total Debit Transaction)": fmt_rp_id(total_debet),
+        "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp_id(total_kredit),
+        "Saldo Akhir (Closing Balance)": fmt_rp_id(saldo_akhir),
+        "_saldo_awal_num": saldo_awal,
+        "_total_debet_num": total_debet,
+        "_total_kredit_num": total_kredit,
+        "_saldo_akhir_num": saldo_akhir,
         "Nama File PDF": pdf_name,
     }
 
 
 # =========================================================
-# 3️⃣  FUNGSI HISTORY SLIK (tidak berubah)
+# 3️⃣  FUNGSI FILTER SLIK → KEMBALIKAN BYTESIO
 # =========================================================
-def process_history_with_filter(df, filename, folder="history"):
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-
+def build_filtered_slik_excel(df: pd.DataFrame, filename: str) -> tuple[BytesIO, str]:
     df_processed = df.copy()
     for col in ['Jenis Penggunaan', 'Kondisi', 'Nama Sesuai Identitas']:
         df_processed[col] = df_processed[col].astype(str).str.strip()
@@ -275,26 +411,22 @@ def process_history_with_filter(df, filename, folder="history"):
         })
 
     result_df = pd.DataFrame(grouped_data)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = os.path.splitext(filename)[0]
-    filepath = os.path.join(folder, f"{base_name}_filtered_{timestamp}.xlsx")
 
-    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         filtered_df.to_excel(writer, sheet_name='Data Terfilter', index=False)
         result_df.to_excel(writer, sheet_name='Ringkasan per Nama', index=False)
         df_processed.to_excel(writer, sheet_name='Data Original', index=False)
-
-    return filepath, f"Berhasil memproses {len(filtered_df)} record dari {len(df)} total record"
+    
+    buf.seek(0)
+    msg = f"Berhasil memproses {len(filtered_df)} record dari {len(df)} total record"
+    return buf, msg
 
 
 # =========================================================
 # 4️⃣  HELPER: buat Excel mutasi dengan baris TOTAL
 # =========================================================
 def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
-    """
-    Tambahkan baris TOTAL di bagian bawah kolom numerik,
-    lalu kembalikan sebagai BytesIO Excel.
-    """
     display_cols = [
         "Nama", "Bulan", "Tahun",
         "Saldo Awal (Opening Balance)",
@@ -305,7 +437,6 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     ]
     df_show = df_mutasi[display_cols].copy()
 
-    # Baris total
     total_debet  = df_mutasi["_total_debet_num"].sum()
     total_kredit = df_mutasi["_total_kredit_num"].sum()
     total_saldo_akhir = df_mutasi["_saldo_akhir_num"].sum()
@@ -315,9 +446,9 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
         "Bulan": "",
         "Tahun": "",
         "Saldo Awal (Opening Balance)": "",
-        "Total Transaksi Debet (Total Debit Transaction)": f"{total_debet:,.2f}",
-        "Total Transaksi Kredit (Total Credit Transaction)": f"{total_kredit:,.2f}",
-        "Saldo Akhir (Closing Balance)": f"{total_saldo_akhir:,.2f}",
+        "Total Transaksi Debet (Total Debit Transaction)": fmt_rp_id(total_debet),
+        "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp_id(total_kredit),
+        "Saldo Akhir (Closing Balance)": fmt_rp_id(total_saldo_akhir),
         "Nama File PDF": "",
     }
     df_total = pd.concat([df_show, pd.DataFrame([total_row])], ignore_index=True)
@@ -325,16 +456,24 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         df_total.to_excel(writer, index=False, sheet_name='Rekap Mutasi')
-
-        # Auto-fit kolom (opsional, agar rapi)
         ws = writer.sheets['Rekap Mutasi']
+        
+        for row in ws.iter_rows(min_row=2, min_col=5, max_col=8):
+            for cell in row:
+                if cell.value and isinstance(cell.value, str):
+                    try:
+                        num_val = float(cell.value.replace('.', '').replace(',', '.'))
+                        cell.value = num_val
+                        cell.number_format = '#,##0.00'
+                    except ValueError:
+                        pass
+        
         for col in ws.columns:
             max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
 
     buf.seek(0)
     return buf
-
 
 # =========================================================
 # 5️⃣  STREAMLIT UI
@@ -367,11 +506,19 @@ if mode == "📊 Rekap SLIK":
 
     if uploaded_files:
         all_data = []
+        errors = []
         with st.spinner("Memproses file SLIK... ⏳"):
             for uf in uploaded_files:
-                df = extract_slik_data_from_bytes(uf.read(), uf.name)
-                if not df.empty:
-                    all_data.append(df)
+                try:
+                    df = extract_slik_data_from_bytes(uf.read(), uf.name)
+                    if not df.empty:
+                        all_data.append(df)
+                except Exception as e:
+                    errors.append(f"{uf.name}: {e}")
+
+        if errors:
+            for err in errors:
+                st.error(f"⚠ {err}")
 
         if all_data:
             df_all = pd.concat(all_data, ignore_index=True)
@@ -380,46 +527,34 @@ if mode == "📊 Rekap SLIK":
             with st.expander("👁️ Preview Data", expanded=True):
                 st.dataframe(df_all, use_container_width=True)
 
-            # --- Simpan History dengan Filter ---
-            st.subheader("💾 Simpan ke History dengan Filter")
+            st.subheader("📥 Download Hasil Filtered SLIK")
             st.info("""
             **Filter:** Jenis Penggunaan = "Modal Kerja" **&** Kondisi = "Fasilitas"  
-            Disimpan dalam 3 sheet: Data Terfilter | Ringkasan per Nama | Data Original
+            File berisi 3 sheet: Data Terfilter | Ringkasan per Nama | Data Original
             """)
 
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                history_filename = st.text_input(
-                    "Nama file history:",
-                    value=f"SLIK_Filtered_{datetime.now().strftime('%Y%m%d')}",
+            excel_buf, filter_msg = build_filtered_slik_excel(df_all, "SLIK_Filtered")
+            
+            if excel_buf:
+                st.success(f"✅ {filter_msg}")
+                
+                mask = (
+                    df_all['Jenis Penggunaan'].str.contains('Modal Kerja', case=False, na=False) &
+                    df_all['Kondisi'].str.contains('Fasilitas', case=False, na=False)
                 )
-            with col2:
-                st.write("")
-                save_btn = st.button("💾 Simpan History", type="primary")
+                with st.expander("👁️ Preview Data Terfilter"):
+                    st.dataframe(df_all[mask], use_container_width=True)
 
-            if save_btn and history_filename.strip():
-                fn = history_filename.strip()
-                if not fn.endswith('.xlsx'):
-                    fn += '.xlsx'
-                with st.spinner("Menyimpan..."):
-                    try:
-                        path, msg = process_history_with_filter(df_all, fn)
-                        if path:
-                            st.success(f"✅ {msg}")
-                            st.success(f"📁 Tersimpan di: `{path}`")
-                            # Preview filter result
-                            mask = (
-                                df_all['Jenis Penggunaan'].str.contains('Modal Kerja', case=False, na=False) &
-                                df_all['Kondisi'].str.contains('Fasilitas', case=False, na=False)
-                            )
-                            st.dataframe(df_all[mask].head(10), use_container_width=True)
-                        else:
-                            st.warning(f"⚠ {msg}")
-                    except Exception as e:
-                        st.error(f"❌ Error: {e}")
+                st.download_button(
+                    "⬇️ Unduh SLIK Filtered (Excel)",
+                    data=excel_buf,
+                    file_name=f"SLIK_Filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            else:
+                st.warning(f"⚠ {filter_msg}")
 
-            # --- Download Excel lengkap ---
-            st.subheader("📥 Download Hasil Ekstraksi")
+            st.subheader("📥 Download Hasil Ekstraksi Lengkap")
             buf = BytesIO()
             df_all.to_excel(buf, index=False)
             buf.seek(0)
@@ -430,7 +565,6 @@ if mode == "📊 Rekap SLIK":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            # --- Statistik ---
             with st.expander("📈 Statistik Data"):
                 c1, c2, c3 = st.columns(3)
                 mask_mk = df_all['Jenis Penggunaan'].str.contains('Modal Kerja', case=False, na=False)
@@ -440,7 +574,7 @@ if mode == "📊 Rekap SLIK":
                 c2.metric("Modal Kerja", mask_mk.sum())
                 c2.metric("Kondisi Fasilitas", mask_fa.sum())
                 c3.metric("Modal Kerja + Fasilitas", (mask_mk & mask_fa).sum())
-        else:
+        elif not errors:
             st.warning("⚠ Tidak ada data yang berhasil diekstrak.")
 
 # ===========================================================
@@ -448,7 +582,9 @@ if mode == "📊 Rekap SLIK":
 # ===========================================================
 else:
     st.subheader("🏦 Rekap Mutasi Rekening")
-    st.write("Unggah satu atau beberapa file PDF mutasi rekening BRI (format BRISIM).")
+    st.write("Unggah satu atau beberapa file PDF mutasi rekening (mendukung format **BCA** & **BRI**).")
+    
+    st.info("💡 **Catatan:** Untuk PDF e-statement BCA yang terenkripsi, pastikan library **PyCryptodome** sudah terinstall (`pip install PyCryptodome`).")
 
     uploaded_files = st.file_uploader(
         "Tarik & lepaskan file PDF Mutasi Rekening di sini",
@@ -472,14 +608,12 @@ else:
 
         if errors:
             for err in errors:
-                st.warning(f"⚠ {err}")
+                st.error(f"⚠ {err}")
 
         if results:
             df_mutasi = pd.DataFrame(results)
-
             st.success(f"✅ Berhasil memproses {len(results)} file PDF!")
 
-            # ---- Preview tabel dengan baris TOTAL ----
             display_cols = [
                 "Nama", "Bulan", "Tahun",
                 "Saldo Awal (Opening Balance)",
@@ -498,9 +632,9 @@ else:
                 "Bulan": "",
                 "Tahun": "",
                 "Saldo Awal (Opening Balance)": "",
-                "Total Transaksi Debet (Total Debit Transaction)": f"{total_debet:,.2f}",
-                "Total Transaksi Kredit (Total Credit Transaction)": f"{total_kredit:,.2f}",
-                "Saldo Akhir (Closing Balance)": f"{total_saldo_akhir:,.2f}",
+                "Total Transaksi Debet (Total Debit Transaction)": fmt_rp_id(total_debet),
+                "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp_id(total_kredit),
+                "Saldo Akhir (Closing Balance)": fmt_rp_id(total_saldo_akhir),
                 "Nama File PDF": "",
             }
 
@@ -510,26 +644,22 @@ else:
             )
 
             with st.expander("👁️ Preview Rekap Mutasi", expanded=True):
-                # Highlight baris TOTAL
                 def highlight_total(row):
                     if str(row["Nama"]).startswith("➕"):
                         return ['background-color: #fff3cd; font-weight: bold'] * len(row)
                     return [''] * len(row)
-
                 st.dataframe(
                     df_preview.style.apply(highlight_total, axis=1),
                     use_container_width=True,
                     hide_index=True,
                 )
 
-            # ---- Metrik ringkasan ----
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("File Diproses", len(results))
             c2.metric("Total Debet",   f"Rp {total_debet:,.0f}")
             c3.metric("Total Kredit",  f"Rp {total_kredit:,.0f}")
             c4.metric("Total Saldo Akhir", f"Rp {total_saldo_akhir:,.0f}")
 
-            # ---- Download Excel ----
             st.subheader("📥 Download Rekap Mutasi")
             excel_buf = build_mutasi_excel(df_mutasi)
             st.download_button(
@@ -538,7 +668,7 @@ else:
                 file_name=f"Rekap_Mutasi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-        else:
+        elif not errors:
             st.warning("⚠ Tidak ada data mutasi yang berhasil diekstrak dari PDF yang diunggah.")
     else:
         st.info("📎 Silakan unggah satu atau beberapa file PDF Mutasi Rekening.")
