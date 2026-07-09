@@ -424,7 +424,65 @@ def build_filtered_slik_excel(df: pd.DataFrame, filename: str) -> tuple[BytesIO,
 
 
 # =========================================================
-# 4️⃣  HELPER: buat Excel mutasi dengan baris TOTAL
+# 4️⃣  FUNGSI HISTORY SLIK (dari kode kedua)
+# =========================================================
+def process_history_with_filter(df, filename, folder="history"):
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    df_processed = df.copy()
+    for col in ['Jenis Penggunaan', 'Kondisi', 'Nama Sesuai Identitas']:
+        df_processed[col] = df_processed[col].astype(str).str.strip()
+
+    filtered_df = df_processed[
+        df_processed['Jenis Penggunaan'].str.contains('Modal Kerja', case=False, na=False) &
+        df_processed['Kondisi'].str.contains('Fasilitas', case=False, na=False)
+    ].copy()
+
+    if filtered_df.empty:
+        return None, "Tidak ada data yang memenuhi kriteria filter"
+
+    def conv_rp(s):
+        try:
+            return float(str(s).replace('Rp','').replace(' ','').replace('.','').replace(',','.'))
+        except Exception:
+            return 0.0
+
+    filtered_df['Baki Debet Numeric'] = filtered_df['Baki Debet'].apply(conv_rp)
+
+    grouped_data = []
+    for nama, group in filtered_df.groupby('Nama Sesuai Identitas'):
+        total = group['Baki Debet Numeric'].sum()
+        total_fmt = f"Rp {total:,.2f}".replace(',','X').replace('.',',').replace('X','.')
+        sample = group.iloc[0]
+        grouped_data.append({
+            "Nama Sesuai Identitas": nama,
+            "Total Baki Debet": total_fmt,
+            "Jumlah Fasilitas": len(group),
+            "Pelapor": ", ".join(group['Pelapor'].unique()[:3]),
+            "Jenis Penggunaan": sample['Jenis Penggunaan'],
+            "Kondisi": sample['Kondisi'],
+            "Kualitas": sample['Kualitas'],
+            "Rata-rata Kualitas": group['Kualitas'].apply(
+                lambda x: float(x) if str(x).isdigit() else 0).mean(),
+            "Jumlah Record": len(group),
+        })
+
+    result_df = pd.DataFrame(grouped_data)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = os.path.splitext(filename)[0]
+    filepath = os.path.join(folder, f"{base_name}_{timestamp}.xlsx")
+
+    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+        filtered_df.to_excel(writer, sheet_name='Data Terfilter', index=False)
+        result_df.to_excel(writer, sheet_name='Ringkasan per Nama', index=False)
+        df_processed.to_excel(writer, sheet_name='Data Original', index=False)
+
+    return filepath, f"Berhasil memproses {len(filtered_df)} record dari {len(df)} total record"
+
+
+# =========================================================
+# 5️⃣  HELPER: buat Excel mutasi dengan baris TOTAL
 # =========================================================
 def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     display_cols = [
@@ -476,7 +534,7 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     return buf
 
 # =========================================================
-# 5️⃣  STREAMLIT UI
+# 6️⃣  STREAMLIT UI
 # =========================================================
 st.set_page_config(page_title="SLIK & Mutasi Extractor", page_icon="📄", layout="wide")
 st.title("📄 SLIK & Mutasi Rekening Extractor")
@@ -527,6 +585,45 @@ if mode == "📊 Rekap SLIK":
             with st.expander("👁️ Preview Data", expanded=True):
                 st.dataframe(df_all, use_container_width=True)
 
+            # --- Simpan History dengan Filter (dari kode kedua) ---
+            st.subheader("💾 Simpan ke History dengan Filter")
+            st.info("""
+            **Filter:** Jenis Penggunaan = "Modal Kerja" **&** Kondisi = "Fasilitas"  
+            Disimpan dalam 3 sheet: Data Terfilter | Ringkasan per Nama | Data Original
+            """)
+
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                history_filename = st.text_input(
+                    "Nama file history:",
+                    value=f"SLIK_Filtered_{datetime.now().strftime('%Y%m%d')}",
+                )
+            with col2:
+                st.write("")
+                save_btn = st.button("💾 Simpan History", type="primary")
+
+            if save_btn and history_filename.strip():
+                fn = history_filename.strip()
+                if not fn.endswith('.xlsx'):
+                    fn += '.xlsx'
+                with st.spinner("Menyimpan..."):
+                    try:
+                        path, msg = process_history_with_filter(df_all, fn)
+                        if path:
+                            st.success(f"✅ {msg}")
+                            st.success(f"📁 Tersimpan di: `{path}`")
+                            # Preview filter result
+                            mask = (
+                                df_all['Jenis Penggunaan'].str.contains('Modal Kerja', case=False, na=False) &
+                                df_all['Kondisi'].str.contains('Fasilitas', case=False, na=False)
+                            )
+                            st.dataframe(df_all[mask].head(10), use_container_width=True)
+                        else:
+                            st.warning(f"⚠ {msg}")
+                    except Exception as e:
+                        st.error(f"❌ Error: {e}")
+
+            # --- Download hasil filtered SLIK (dari kode pertama) ---
             st.subheader("📥 Download Hasil Filtered SLIK")
             st.info("""
             **Filter:** Jenis Penggunaan = "Modal Kerja" **&** Kondisi = "Fasilitas"  
@@ -554,6 +651,7 @@ if mode == "📊 Rekap SLIK":
             else:
                 st.warning(f"⚠ {filter_msg}")
 
+            # --- Download Excel lengkap ---
             st.subheader("📥 Download Hasil Ekstraksi Lengkap")
             buf = BytesIO()
             df_all.to_excel(buf, index=False)
@@ -565,6 +663,7 @@ if mode == "📊 Rekap SLIK":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
+            # --- Statistik ---
             with st.expander("📈 Statistik Data"):
                 c1, c2, c3 = st.columns(3)
                 mask_mk = df_all['Jenis Penggunaan'].str.contains('Modal Kerja', case=False, na=False)
